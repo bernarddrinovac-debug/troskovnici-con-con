@@ -1,170 +1,182 @@
-import streamlit as st
+import io, re
+from datetime import datetime
+import numpy as np
 import pandas as pd
-import glob
-import os
+import streamlit as st
 import plotly.express as px
 
-# --- POSTAVKE STRANICE ---
-st.set_page_config(page_title="Baza Troškovnika", page_icon="🏗️", layout="wide")
+st.set_page_config(page_title="Centralna baza troškovnika", layout="wide")
 
-# CSS za ljepši izgled
 st.markdown("""
-    <style>
-    .main { background-color: #f5f5f5; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 1px 1px 5px rgba(0,0,0,0.1); }
-    </style>
-    """, unsafe_allow_html=True)
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Source+Serif+Pro:wght@400;600&display=swap');
+:root{--emerald:#065f46;--gold:#b45309;--ink:#0f172a;--bg:#f8fafc;--border:#cbd5e1;--card:#fff;}
+html, body, [class*="css"]{font-family:"Source Serif Pro",serif;color:var(--ink);background:var(--bg);}
+h1,h2,h3{font-family:"Playfair Display",serif !important;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 8px 24px rgba(15,23,42,0.06);}
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid var(--border);font-size:0.9rem;}
+.badge.em{color:var(--emerald);border-color:rgba(6,95,70,0.3);background:rgba(6,95,70,0.06);}
+.badge.go{color:var(--gold);border-color:rgba(180,83,9,0.3);background:rgba(180,83,9,0.06);}
+</style>
+""", unsafe_allow_html=True)
 
-# --- FUNKCIJA ZA UČITAVANJE (CACHE) ---
-@st.cache_data
-def load_data():
-    # Tražimo datoteke u mapi 'podaci'
-    path_csv = os.path.join("podaci", "*.csv")
-    path_xlsx = os.path.join("podaci", "*.xlsx")
-    
-    all_files = glob.glob(path_csv) + glob.glob(path_xlsx)
-    
-    all_data = []
-    
-    # Ključne riječi za prepoznavanje
-    desc_keywords = ['opis', 'vrsta rada', 'naziv stavke']
-    unit_keywords = ['j.m.', 'jed. mj.', 'jedinica', 'mjera']
-    price_keywords = ['jed. cijena', 'jedinična cijena', 'cijena']
+st.markdown("""
+<div class="card">
+  <span class="badge em">Centralna baza</span>
+  <span class="badge go" style="margin-left:8px;">Povijesne cijene</span>
+  <h1 style="margin:10px 0 0 0;">Troškovnici → aktivno znanje</h1>
+  <div style="margin-top:8px;opacity:0.9;">
+    Uploadaj XLSX troškovnike (više komada). Aplikacija spoji stavke u jedinstvenu bazu i omogući pretragu te analitiku cijena.
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+def guess_date_from_filename(name: str):
+    s = name
+    m = re.search(r"(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})", s)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return datetime(y, mo, d).date()
+    m = re.search(r"(\d{1,2})[.](\d{1,2})[.](20\d{2})", s)
+    if m:
+        d, mo, y = map(int, m.groups())
+        return datetime(y, mo, d).date()
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})", s)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return datetime(y, mo, d).date()
+    return None
 
-    for idx, file_path in enumerate(all_files):
-        status_text.text(f"Učitavam: {os.path.basename(file_path)}...")
-        progress_bar.progress((idx + 1) / len(all_files))
-        
-        try:
-            # Detekcija ekstenzije
-            if file_path.endswith('.csv'):
-                df_preview = pd.read_csv(file_path, header=None, nrows=20, on_bad_lines='skip', encoding='utf-8')
-            else:
-                df_preview = pd.read_excel(file_path, header=None, nrows=20)
+def normalize_table(df: pd.DataFrame, source_file: str, sheet: str) -> pd.DataFrame:
+    cols = {c: str(c).strip() for c in df.columns}
+    df = df.rename(columns=cols)
 
-            # Pronalazak zaglavlja
-            header_idx = -1
-            for i, row in df_preview.iterrows():
-                row_str = row.astype(str).str.lower().tolist()
-                row_joined = ' '.join(row_str)
-                if any(k in row_joined for k in price_keywords) and any(k in row_joined for k in desc_keywords):
-                    header_idx = i
-                    break
-            
-            if header_idx == -1: continue
+    def find_col(options):
+        # exact
+        for o in options:
+            for c in df.columns:
+                if str(c).strip().lower() == o.lower():
+                    return c
+        # contains
+        for o in options:
+            for c in df.columns:
+                if o.lower() in str(c).lower():
+                    return c
+        return None
 
-            # Učitavanje pravih podataka
-            if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path, header=header_idx, on_bad_lines='skip')
-            else:
-                df = pd.read_excel(file_path, header=header_idx)
+    c_desc = find_col(["Opis", "Naziv", "Stavka", "Opis stavke"])
+    c_unit = find_col(["JM", "J.M.", "Jed mj", "Jed. mjere", "Mjerna jedinica"])
+    c_qty  = find_col(["Količina", "Kol", "Qty"])
+    c_up   = find_col(["Jedinična cijena", "Jed. cijena", "Cijena", "Unit price"])
+    c_tot  = find_col(["Iznos", "Ukupno", "Vrijednost", "Total"])
 
-            df.columns = [str(c).lower().strip() for c in df.columns]
-
-            # Mapiranje stupaca
-            col_map = {'opis': None, 'jm': None, 'cijena': None}
-            for col in df.columns:
-                if any(k in col for k in desc_keywords) and not col_map['opis']: col_map['opis'] = col
-                if any(k in col for k in unit_keywords) and not col_map['jm']: col_map['jm'] = col
-                if any(k in col for k in price_keywords) and not col_map['cijena']: col_map['cijena'] = col
-
-            if not col_map['opis'] or not col_map['cijena']: continue
-
-            df = df[[col_map['opis'], col_map['jm'], col_map['cijena']]].copy()
-            df.columns = ['Opis', 'JM', 'Cijena']
-
-            # Metapodaci iz imena datoteke
-            filename = os.path.basename(file_path)
-            project_name = filename.split('.')[0]
-            
-            # Jednostavna kategorizacija prema imenu datoteke
-            cat = "Ostalo"
-            lname = filename.lower()
-            if "građ" in lname: cat = "Građevinski radovi"
-            elif "elek" in lname: cat = "Elektroinstalacije"
-            elif "stroj" in lname or "grijanje" in lname: cat = "Strojarski radovi"
-            elif "vod" in lname or "kanal" in lname: cat = "Vodovod i Odvodnja"
-            elif "okoliš" in lname or "horti" in lname: cat = "Krajobrazno uređenje"
-            
-            df['Projekt'] = project_name
-            df['Kategorija'] = cat
-
-            # Čišćenje cijena
-            df['Cijena'] = df['Cijena'].astype(str).str.replace('€','').str.replace('kn','').str.replace('.','').str.replace(',','.').str.strip()
-            df['Cijena'] = pd.to_numeric(df['Cijena'], errors='coerce')
-            
-            df = df.dropna(subset=['Cijena', 'Opis'])
-            df = df[df['Cijena'] > 0]
-            
-            all_data.append(df)
-
-        except Exception:
-            continue
-
-    status_text.empty()
-    progress_bar.empty()
-
-    if all_data:
-        return pd.concat(all_data, ignore_index=True)
-    else:
+    if c_desc is None:
         return pd.DataFrame()
 
-# --- GLAVNI DIO APLIKACIJE ---
+    out = pd.DataFrame()
+    out["opis"] = df[c_desc].astype(str)
+    out["jm"] = df[c_unit].astype(str) if c_unit else ""
+    out["kolicina"] = pd.to_numeric(df[c_qty], errors="coerce") if c_qty else np.nan
+    out["jed_cijena"] = pd.to_numeric(df[c_up], errors="coerce") if c_up else np.nan
+    out["iznos"] = pd.to_numeric(df[c_tot], errors="coerce") if c_tot else np.nan
 
-st.title("🏗️ Baza Povijesnih Podataka")
-st.markdown("Sustav za pretragu cijena iz svih učitanih Excel/CSV troškovnika.")
+    out["source_file"] = source_file
+    out["sheet"] = sheet
+    out["datum"] = guess_date_from_filename(source_file)
 
-df = load_data()
+    out = out[out["opis"].str.strip().ne("")].copy()
+    out = out[~out["opis"].str.lower().isin(["opis", "stavka", "naziv"])].copy()
+    return out
 
-if df.empty:
-    st.warning("⚠️ Nema podataka! Provjerite jeste li stavili datoteke u mapu 'podaci'.")
+def read_xlsx_bytes(xlsx_bytes: bytes, filename: str) -> pd.DataFrame:
+    xls = pd.ExcelFile(io.BytesIO(xlsx_bytes))
+    frames = []
+    for sh in xls.sheet_names:
+        try:
+            raw = xls.parse(sh)
+            if raw.shape[0] < 3:
+                continue
+            frames.append(normalize_table(raw, filename, sh))
+        except Exception:
+            continue
+    frames = [f for f in frames if not f.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+def ingest_xlsx_files(files) -> pd.DataFrame:
+    frames = []
+    for f in files:
+        if f.name.lower().endswith(".xlsx") and not f.name.startswith("~$"):
+            frames.append(read_xlsx_bytes(f.getvalue(), f.name))
+    frames = [x for x in frames if not x.empty]
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out["opis_norm"] = (out["opis"]
+                        .str.lower()
+                        .str.replace(r"\s+", " ", regex=True)
+                        .str.replace(r"[^\w\sčćđšž]", "", regex=True))
+    return out
+
+st.write("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+xlsx_files = st.file_uploader("Učitaj XLSX troškovnike (može više odjednom):", type=["xlsx"], accept_multiple_files=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if not xlsx_files:
+    st.info("Učitaj jedan ili više XLSX troškovnika i aplikacija će izgraditi centralnu bazu.")
+    st.stop()
+
+with st.spinner("Učitavam XLSX datoteke i gradim bazu..."):
+    base = ingest_xlsx_files(xlsx_files)
+
+if base.empty:
+    st.error("Nisam uspio prepoznati tablice. Ako su kolone jako nestandardne, treba pojačati mapiranje stupaca (FAZA 2).")
+    st.stop()
+
+st.write("")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Redova (stavki)", f"{len(base):,}")
+c2.metric("Datoteka", base["source_file"].nunique())
+c3.metric("Sheetova", base["sheet"].nunique())
+c4.metric("Datuma prepoznato", int(base["datum"].notna().sum()))
+
+st.write("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.subheader("Pretraga stavki")
+q = st.text_input("Opis (npr. 'PVC prozor', 'armatura', 'estrih')", value="")
+jm = st.text_input("JM filter (opcionalno)", value="")
+st.markdown("</div>", unsafe_allow_html=True)
+
+f = base.copy()
+if q.strip():
+    qq = re.sub(r"\s+", " ", q.strip().lower())
+    qq = re.sub(r"[^\w\sčćđšž]", "", qq)
+    f = f[f["opis_norm"].str.contains(qq, na=False)]
+if jm.strip():
+    f = f[f["jm"].str.contains(jm.strip(), case=False, na=False)]
+
+st.write("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.subheader("Rezultati")
+st.dataframe(f.sort_values(["datum","jed_cijena"], ascending=[True, True]), use_container_width=True, height=420)
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.write("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.subheader("Povijest jedinične cijene (ako postoji datum)")
+g = f.dropna(subset=["datum","jed_cijena"]).copy()
+if len(g) >= 3:
+    fig = px.scatter(g, x="datum", y="jed_cijena", color="source_file", hover_data=["opis","jm","kolicina","iznos","sheet"])
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    # Sidebar Filteri
-    st.sidebar.header("Filteri")
-    cats = st.sidebar.multiselect("Kategorija", df['Kategorija'].unique(), default=df['Kategorija'].unique())
-    projs = st.sidebar.multiselect("Projekt", df['Projekt'].unique(), default=df['Projekt'].unique())
-    
-    df_filtered = df[(df['Kategorija'].isin(cats)) & (df['Projekt'].isin(projs))]
+    st.caption("Nema dovoljno redova s datumom i jediničnom cijenom za graf. (Datum se pokušava pogoditi iz naziva datoteke.)")
+st.markdown("</div>", unsafe_allow_html=True)
 
-    # Glavna tražilica
-    search = st.text_input("🔍 Pretraži stavku (npr. 'beton', 'kabel', 'gletanje')", placeholder="Upišite pojam...")
-
-    if search:
-        # Filtriranje
-        results = df_filtered[df_filtered['Opis'].str.contains(search, case=False, na=False)]
-        
-        st.subheader(f"Rezultati za: '{search}' ({len(results)} stavki)")
-        
-        if not results.empty:
-            # Kartice s brojkama
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Min. Cijena", f"{results['Cijena'].min():.2f} €")
-            c2.metric("Prosječna Cijena", f"{results['Cijena'].mean():.2f} €")
-            c3.metric("Max. Cijena", f"{results['Cijena'].max():.2f} €")
-            
-            # Grafikon
-            fig = px.box(results, x="Cijena", y="Kategorija", points="all", 
-                         hover_data=["Opis", "Projekt"], color="Kategorija",
-                         title="Analiza raspona cijena")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Tablica
-            st.dataframe(results[['Opis', 'JM', 'Cijena', 'Projekt', 'Kategorija']].sort_values('Cijena'), 
-                         use_container_width=True, hide_index=True)
-        else:
-            st.info("Nema rezultata za taj pojam.")
-    
-    else:
-        st.info("👆 Upišite pojam u tražilicu za početak.")
-        st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("### Statistika baze")
-            st.write(f"Ukupno stavki: **{len(df)}**")
-            st.write(f"Broj projekata: **{len(df['Projekt'].unique())}**")
-        with col2:
-            fig_pie = px.pie(df, names='Kategorija', title='Distribucija podataka')
-            st.plotly_chart(fig_pie, use_container_width=True)
+st.write("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.subheader("Preuzmi centralnu bazu")
+st.caption("Preuzmi 'master' dataset. Preporuka: spremi kao master.parquet i committaj u repo u folder data/.")
+parquet_bytes = io.BytesIO()
+base.to_parquet(parquet_bytes, index=False)
+st.download_button("Download master.parquet", data=parquet_bytes.getvalue(), file_name="master.parquet")
+st.markdown("</div>", unsafe_allow_html=True)
